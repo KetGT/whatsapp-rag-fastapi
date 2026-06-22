@@ -3,16 +3,39 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Response
 import uvicorn
 import requests
+from openai import OpenAI
 
-# Cargar las variables de entorno del archivo .env
 load_dotenv()
 
 app = FastAPI()
 
-# Ahora las traemos de forma segura usando os.getenv
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+BUSINESS_NAME = os.getenv("BUSINESS_NAME")
+# Inicializamos el cliente de OpenAI
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+# --- NUEVA FUNCIÓN: EL CEREBRO DEL BOT ---
+def generar_respuesta_ia(texto_usuario):
+    try:
+        respuesta = client.chat.completions.create(
+            model="gpt-4o-mini", # Usamos el modelo más rápido y económico
+            messages=[
+                # El "System Prompt": Acá le damos la personalidad y las reglas
+                {"role": "system", "content": f"Sos el asistente virtual de {BUSINESS_NAME}. Tu tono es profesional, amable y conciso. Tu objetivo es responder consultas sobre alquileres. Si te preguntan algo fuera del rubro o no sabés la respuesta, pedí cordialmente que dejen su nombre y domicilio para que un humano los contacte."},
+                # El mensaje real del cliente
+                {"role": "user", "content": texto_usuario}
+            ],
+            max_tokens=150,
+            temperature=0.5 # Qué tan creativo queremos que sea (0 es robótico, 1 es muy creativo)
+        )
+        return respuesta.choices[0].message.content
+    except Exception as e:
+        print(f"Error con OpenAI: {e}")
+        return "Disculpá, en este momento estoy teniendo un problema técnico. ¿Podrías dejarme tu nombre y un humano te contactará a la brevedad?"
+# -----------------------------------------
 
 @app.get("/webhook")
 async def verificar_webhook(request: Request):
@@ -29,13 +52,11 @@ async def recibir_mensajes(request: Request):
     try:
         body = await request.json()
         
-        # Verificamos si es un mensaje de WhatsApp entrante
         if "object" in body and body["object"] == "whatsapp_business_account":
             entry = body["entry"][0]
             changes = entry["changes"][0]
             value = changes["value"]
             
-            # Si hay mensajes nuevos
             if "messages" in value:
                 mensaje_info = value["messages"][0]
                 numero_remitente = mensaje_info["from"]
@@ -43,14 +64,15 @@ async def recibir_mensajes(request: Request):
                 
                 print(f"Mensaje recibido de {numero_remitente}: {texto_recibido}")
                 
-                # --- SOLUCIÓN PARA EL FORMATO DE ARGENTINA ---
-                # Si empieza con 549 (Argentina móvil), le removemos el 9 para que coincida con la lista de Meta
                 if numero_remitente.startswith("549"):
                     numero_remitente = "54" + numero_remitente[3:]
-                # ---------------------------------------------
                 
-                # Le respondemos al usuario
-                enviar_mensaje(numero_remitente, "¡Hola! Gracias por comunicarte con la inmobiliaria. Soy un bot en desarrollo.")
+                # --- ACÁ CONECTAMOS LA IA ---
+                # 1. Le mandamos el texto del cliente a OpenAI
+                respuesta_inteligente = generar_respuesta_ia(texto_recibido)
+                
+                # 2. Le mandamos la respuesta generada por OpenAI a WhatsApp
+                enviar_mensaje(numero_remitente, respuesta_inteligente)
                 
         return Response(content="EVENT_RECEIVED", status_code=200)
     except Exception as e:
@@ -73,8 +95,8 @@ def enviar_mensaje(numero_destino, texto):
     }
     
     response = requests.post(url, headers=headers, json=data)
-    print(f"Estado del envío: {response.status_code}")
-    print(response.text)
+    if response.status_code != 200:
+        print(f"Error de Meta: {response.text}")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
