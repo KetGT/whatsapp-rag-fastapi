@@ -9,3 +9,6 @@ ENV/
 # Archivos temporales de Python
 __pycache__/
 *.pyc
+
+datos_inmobiliaria.json
+avisos.csv
