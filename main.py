@@ -1,7 +1,8 @@
 import os
+import json # <-- Cambiado a json estándar de Python
+import asyncio # <-- NUEVO: Para manejar pausas
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Response
-from flask import json
 import uvicorn
 import requests
 from openai import OpenAI
@@ -13,21 +14,21 @@ app = FastAPI()
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
-
-#OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-
 BUSINESS_NAME = os.getenv("BUSINESS_NAME")
 
-# Inicializamos el cliente de OpenAI
-#client = OpenAI(api_key=OPENAI_API_KEY)
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=OPENROUTER_API_KEY,
 )
 
+# --- MEMORIA DEL BOT ---
+# Acá guardamos la conversación de cada número. 
+# Formato: {"549351XXXXXX": [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]}
+historiales = {}
+# -----------------------
+
 def cargar_catalogo():
-    """Lee el catálogo limpio que generamos con el CSV"""
     try:
         with open("datos_inmobiliaria.json", "r", encoding="utf-8") as f:
             return json.load(f)
@@ -36,12 +37,12 @@ def cargar_catalogo():
         return []
     
     
-def consultar_chatgpt(mensaje_cliente):
-    """Cruza la consulta del cliente con nuestro JSON usando GPT-4o-mini"""
+def consultar_chatgpt(telefono_cliente, mensaje_cliente):
+    """Cruza la consulta considerando el historial completo de ese número"""
     catalogo = cargar_catalogo()
     catalogo_str = json.dumps(catalogo, ensure_ascii=False, indent=2)
 
-    prompt_sistema = f"""Sos el asistente de {BUSINESS_NAME}. Tu tono es profesional pero muy cálido, sumamente amable y muy claro. 
+    prompt_sistema = f"""Sos el asistente de {BUSINESS_NAME}. Tu tono es profesional pero muy cálido, sumamente amable pero divertido y muy claro. 
     Tu único trabajo es ofrecer propiedades basándote ESTRICTAMENTE en este catálogo JSON:
 
     {catalogo_str}
@@ -51,32 +52,45 @@ def consultar_chatgpt(mensaje_cliente):
     2. Si el cliente busca algo que NO está en el catálogo (ej: "Busco un galpón de 500m2"), decile cordialmente que por el momento no contamos con esa disponibilidad. NO inventes propiedades.
     3. Si el cliente quiere hablar con un humano, pagar un alquiler, o hacer un reclamo administrativo, pedile amablemente su Nombre y Apellido y decile que un asesor se comunicará a la brevedad.
     4. Sé conciso. No escribas testamentos gigantescos.
-    5. Actúa como Humano (No digas que eres una inteligencia artificial, ni que estás limitado a un catálogo. No digas que no podés hacer algo. No digas que no podés responder. No digas que no podés ayudar. No digas que no podés dar información. No digas que no podés ofrecer propiedades. No digas que no podés dar detalles de propiedades. No digas que no podés dar precios de propiedades. No digas que no podés dar links de propiedades. No digas que no podés dar fotos de propiedades. No digas que no podés dar características de propiedades. No digas que no podés dar información de contacto de propiedades. No digas que no podés dar información de contacto de la inmobiliaria. No digas que no podés dar información de contacto del asesor humano. No digas que no podés dar información de contacto del propietario. No digas que no podés dar información de contacto del inquilino. No digas que no podés dar información de contacto del arrendador. No digas que no podés dar información de contacto del arrendatario. No digas que no podés dar información de contacto del administrador. No digas que no podés dar información de contacto del encargado. No digas que no podés dar información de contacto del representante legal. No digas que no podés dar información de contacto del abogado. No digas que no podés dar información de contacto del contador. No digas que no podés dar información de contacto del asesor financiero. No digas que no podés dar información de contacto del asesor inmobiliario.)
+    5. Actúa como Humano (No digas que eres una inteligencia artificial, ni que estás limitado a un catálogo...)
     6. Si el cliente te pide que le muestres fotos, respondé con el link de la propiedad y decile que allí podrá ver todas las fotos disponibles. No inventes links ni URLs.
     7. Si el cliente te pide que le muestres un mapa, respondé con el link de la propiedad y decile que allí podrá ver la ubicación exacta en el mapa. No inventes links ni URLs.
     8. Si el cliente te pide que le muestres un video, respondé con el link de la propiedad y decile que allí podrá ver el video disponible. No inventes links ni URLs.
-    9. Empieza cada mensaje primero saludando al cliente por su nombre si lo tenés y diciendole que cualquier consulta te avise. Luego, respondé a su consulta de manera clara y concisa, siguiendo las reglas anteriores. No olvides incluir el link de la propiedad si corresponde.
-
-        """
+    10. Siempre que ofrezcas una propiedad, envía su link correspondiente para que el cliente pueda ver fotos, ubicación y detalles. No inventes links ni URLs.
+    """
     
+    # 1. Si no existe el historial para este número, lo creamos vacío
+    if telefono_cliente not in historiales:
+        historiales[telefono_cliente] = []
+
+    # 2. Agregamos el mensaje nuevo del usuario
+    historiales[telefono_cliente].append({"role": "user", "content": mensaje_cliente})
+
+    # 3. Mantenemos el límite de memoria (últimos 10 mensajes) para no exceder la cuota
+    if len(historiales[telefono_cliente]) > 10:
+        historiales[telefono_cliente] = historiales[telefono_cliente][-10:]
+
+    # 4. Juntamos el system prompt con todo el historial de mensajes
+    mensajes_completos = [{"role": "system", "content": prompt_sistema}] + historiales[telefono_cliente]
+
     try:
         response = client.chat.completions.create(
-            # --- MODELO GRATUITO DE OPENROUTER ---
             model="meta-llama/llama-3-8b-instruct", 
-            messages=[
-                {"role": "system", "content": prompt_sistema},
-                {"role": "user", "content": mensaje_cliente}
-            ],
-            temperature=0.2 # Bajito para que sea preciso y no alucine
+            messages=mensajes_completos,
+            temperature=0.2 
         )
-        return response.choices[0].message.content
+        respuesta_texto = response.choices[0].message.content
+        
+        # 5. Guardamos lo que respondió la IA en el historial para que lo recuerde después
+        historiales[telefono_cliente].append({"role": "assistant", "content": respuesta_texto})
+        
+        return respuesta_texto
     except Exception as e:
-        print(f"Error de OpenAI: {e}")
+        print(f"Error de OpenRouter/OpenAI: {e}")
         return "Disculpá, en este momento estoy experimentando una demora técnica. ¿Podrías dejarme tu consulta y un asesor humano te responderá en breve?"
 
 
 def enviar_whatsapp(telefono_destino, texto_respuesta):
-    """Dispara el mensaje de vuelta al WhatsApp del cliente vía Meta"""
     url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
     headers = {
         "Authorization": f"Bearer {WHATSAPP_TOKEN}",
@@ -96,7 +110,6 @@ def enviar_whatsapp(telefono_destino, texto_respuesta):
         print(f"Error de conexión con Meta: {e}")
 
 
-# Webhook para que Meta verifique nuestro servidor
 @app.get("/webhook")
 async def verificar_meta(request: Request):
     mode = request.query_params.get("hub.mode")
@@ -108,39 +121,45 @@ async def verificar_meta(request: Request):
             return int(challenge)
     return "Verificación fallida", 403
 
-# Webhook principal que escucha los mensajes entrantes
+
 @app.post("/webhook")
 async def recibir_whatsapp(request: Request):
     body = await request.json()
     
     try:
-        # Buceamos en el JSON de Meta para capturar el mensaje de texto
         entrada = body["entry"][0]["changes"][0]["value"]
         if "messages" in entrada:
             mensaje = entrada["messages"][0]
             telefono_cliente = mensaje["from"]
             texto_recibido = mensaje["text"]["body"]
 
-            # --- ARREGLO PARA NÚMEROS ARGENTINOS ---
             if telefono_cliente.startswith("549"):
                 telefono_cliente = "54" + telefono_cliente[3:]
-            # ---------------------------------------
             
             print(f"\n💬 Mensaje de {telefono_cliente}: {texto_recibido}")
 
-            # 1. Pensamos la respuesta con IA
-            respuesta_ia = consultar_chatgpt(texto_recibido)
+            # --- LÓGICA DEL SALUDO INICIAL ---
+            # Si el número no está en historiales, significa que es una conversación nueva
+            es_nuevo = telefono_cliente not in historiales
+            
+            if es_nuevo:
+                print("🚀 Nueva conversación: Enviando saludo inicial...")
+                enviar_whatsapp(telefono_cliente, "¡Hola! ¿Cómo estás? Dame un segundito que ya te atiendo...")
+                # Pausa para dar tiempo a la IA a procesar y que los mensajes lleguen en orden
+                await asyncio.sleep(2)
+            # ---------------------------------
+
+            # 1. Pensamos la respuesta con IA (pasándole el teléfono para la memoria)
+            respuesta_ia = consultar_chatgpt(telefono_cliente, texto_recibido)
             print(f"🤖 Respondiendo: {respuesta_ia}")
 
             # 2. Se la enviamos al cliente
             enviar_whatsapp(telefono_cliente, respuesta_ia)
 
     except KeyError:
-        # Ignoramos los avisos de "mensaje entregado" o "leído" que manda Meta
         pass
 
     return {"status": "ok"}
-
 
 
 if __name__ == "__main__":
